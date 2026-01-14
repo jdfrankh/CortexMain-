@@ -10,6 +10,7 @@ from tkinter import ttk, messagebox, filedialog, DoubleVar
 
 import csv
 import subprocess
+import sys
 import re
 from AB525 import PowerFlex525
 from pylogix import PLC
@@ -319,11 +320,41 @@ class CalibrationGUI:
         status.pack(side=tk.BOTTOM, fill=tk.X)
 
     def get_ethernet_ips(self):
-        with PLC() as comm:
-            devices = comm.Discover()
+        # Use pylogix discovery on Windows; on Linux fall back to parsing `ip`/`ifconfig` output
+        if sys.platform.startswith("win"):
+            with PLC() as comm:
+                devices = comm.Discover()
+            return devices
 
-        # Filter to ethernet-like adapters (case-insensitive)
-        return devices#[(a, ip) for (a, ip) in adapters if "ethernet" in a.lower()]
+        # Linux / other POSIX: parse `ip -4 -o addr` for IPv4 addresses
+        try:
+            out = subprocess.check_output(["ip", "-4", "-o", "addr"], stderr=subprocess.DEVNULL, text=True)
+            results = []
+            for line in out.splitlines():
+                parts = line.split()
+                # expected format: "<idx>: <ifname>    inet <ip>/<prefix> ..."
+                if len(parts) < 4:
+                    continue
+                ifname = parts[1]
+                if 'inet' in parts:
+                    idx = parts.index('inet')
+                    ip_cidr = parts[idx + 1]
+                    ip = ip_cidr.split('/')[0]
+                    # filter common ethernet-like interface names
+                    if ifname.startswith(("eth", "en", "enp")):
+                        results.append((ifname, ip))
+
+            # fallback to parsing ifconfig output if nothing found
+            if not results:
+                out2 = subprocess.check_output(["ifconfig"], stderr=subprocess.DEVNULL, text=True)
+                for m in re.finditer(r"^([\w-]+).*?\n(?:.*?inet (?:addr:)?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+))", out2, re.M | re.S):
+                    ifname, ip = m.group(1), m.group(2)
+                    if ifname.startswith(("eth", "en", "enp")):
+                        results.append((ifname, ip))
+
+            return results
+        except Exception:
+            return []
         
     def on_scan(self):
         """Scan for Ethernet IPs and show them in a separate window for selection."""
@@ -339,8 +370,19 @@ class CalibrationGUI:
 
         lb = tk.Listbox(top, selectmode=tk.SINGLE)
         lb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        for device in results.Value:
-            lb.insert(tk.END, f"{device.ProductName} — {device.IPAddress}")
+        # Support both pylogix discovery results (with .Value) and
+        # a simple list of (iface, ip) tuples returned on Linux.
+        if hasattr(results, "Value"):
+            items = []
+            for d in results.Value:
+                name = getattr(d, 'ProductName', None) or getattr(d, 'DeviceName', '') or 'Device'
+                ip = getattr(d, 'IPAddress', getattr(d, 'IpAddress', ''))
+                items.append((name, ip))
+        else:
+            items = [(iface, ip) for (iface, ip) in results]
+
+        for name, ip in items:
+            lb.insert(tk.END, f"{name} — {ip}")
 
         btns = ttk.Frame(top)
         btns.pack(fill=tk.X, padx=8, pady=(0, 8))
